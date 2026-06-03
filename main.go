@@ -93,8 +93,9 @@ var (
 type VODMetadata struct {
 	UUID        string          `json:"uuid"`
 	Title       string          `json:"title"`
-	Source      string          `json:"source"`
-	StartTime   time.Time       `json:"start_time"`
+	Source       string          `json:"source"`
+	IVSChannelID string          `json:"ivs_channel_id"`
+	StartTime    time.Time       `json:"start_time"`
 	Duration    int             `json:"duration_seconds"`
 	IsMature    bool            `json:"is_mature"`
 	Language    string          `json:"language"`
@@ -643,23 +644,25 @@ func verifyYtDlp() error {
 
 // Internal struct used for unmarshalling the complex JSON data from the VOD page.
 type fullVODData struct {
-	UUID       string `json:"uuid"`
-	Views      int    `json:"views"`
-	Source     string `json:"source"`
+	UUID      string `json:"uuid"`
+	Views     int    `json:"views"`
+	Source    string `json:"source"`
 	Livestream struct {
 		SessionTitle string `json:"session_title"`
 		IsMature     bool   `json:"is_mature"`
 		StartTime    string `json:"start_time"`
 		Duration     int    `json:"duration"`
-		Language     string `json:"language"`
-		Tags         []string
-		Categories   []struct {
+		Language  string `json:"language"`
+		Thumbnail string `json:"thumbnail"`
+		Tags      []string
+		Categories []struct {
 			Name string `json:"name"`
 			Slug string `json:"slug"`
 		} `json:"categories"`
 		Channel struct {
 			ID                  int    `json:"id"`
 			Slug                string `json:"slug"`
+			PlaybackURL         string `json:"playback_url"`
 			FollowersCount      int    `json:"followersCount"`
 			SubscriptionEnabled bool   `json:"subscription_enabled"`
 			Verified            *struct {
@@ -783,9 +786,14 @@ func extractVODMetadata(url string) (*VODMetadata, error) {
 		categories = append(categories, Category{Name: cat.Name, Slug: cat.Slug})
 	}
 
-	// Map the parsed data to our clean VODMetadata struct.
+	// Extract IVS channel ID from playback_url: ...channel.{id}.m3u8
+	var ivsChannelID string
+	if m := regexp.MustCompile(`\.channel\.([A-Za-z0-9]+)\.m3u8`).FindStringSubmatch(data.Livestream.Channel.PlaybackURL); len(m) > 1 {
+		ivsChannelID = m[1]
+	}
+
 	return &VODMetadata{
-		UUID: data.UUID, Title: data.Livestream.SessionTitle, Source: data.Source, StartTime: startTime,
+		UUID: data.UUID, Title: data.Livestream.SessionTitle, Source: data.Source, IVSChannelID: ivsChannelID, StartTime: startTime,
 		Duration: data.Livestream.Duration / 1000, IsMature: data.Livestream.IsMature, Language: data.Livestream.Language,
 		Tags: data.Livestream.Tags, Views: data.Views, Categories: categories, ChatroomID: chatroomID,
 		ChannelInfo: ChannelInfo{
@@ -870,14 +878,64 @@ func getVODSize(source string) (int64, error) {
 	return maxSize, nil
 }
 
+// resolveVODSource returns the HLS source URL for the VOD.
+// For sub-only VODs the "source" field is empty, so it probes Kick's CDN directly
+// by reconstructing the IVS path from the thumbnail URL (technique from KickNoSub).
+func resolveVODSource(metadata *VODMetadata) (string, error) {
+	if metadata.Source != "" {
+		return metadata.Source, nil
+	}
+	if metadata.IVSChannelID == "" {
+		return "", fmt.Errorf("sub-only VOD: IVS channel ID unavailable")
+	}
+	ivsChannelID := metadata.IVSChannelID
+	bases := []string{
+		"https://stream.kick.com/ivs/v1/196233775518",
+		"https://stream.kick.com/3c81249a5ce0/ivs/v1/196233775518",
+		"https://stream.kick.com/0f3cb0ebce7/ivs/v1/196233775518",
+	}
+	logz("info", EMOJI_RECYCLE, "Source URL empty (sub-only VOD), probing CDN paths...")
+	t := metadata.StartTime.UTC()
+	for offset := -5; offset <= 5; offset++ {
+		adj := t.Add(time.Duration(offset) * time.Minute)
+		for _, base := range bases {
+			u := fmt.Sprintf("%s/%s/%d/%d/%d/%d/%d/%s/media/hls/master.m3u8",
+				base, ivsChannelID, adj.Year(), int(adj.Month()), adj.Day(), adj.Hour(), adj.Minute(), metadata.UUID)
+			logz("debug", EMOJI_BUG, "Probing CDN: %s", u)
+			resp, err := httpHeadOnce(u)
+			if err == nil && resp.StatusCode == 200 {
+				resp.Body.Close()
+				logz("ok", EMOJI_CHECK, "Found stream at CDN offset %+dmin", offset)
+				return u, nil
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}
+	}
+	return "", fmt.Errorf("could not locate CDN stream URL within ±5min of start time")
+}
+
+func httpHeadOnce(url string) (*http.Response, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, _ := http.NewRequest("HEAD", url, nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	return client.Do(req)
+}
+
 // downloadVOD handles the entire VOD download process using yt-dlp.
 func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
 	logz("info", EMOJI_FILM, "Starting VOD download...")
 
 	outputPath := filepath.Join(archiveDir, "vod.mp4")
 
+	source, err := resolveVODSource(metadata)
+	if err != nil {
+		return err
+	}
+
 	// Pre-flight check for available disk space.
-	vodSize, err := getVODSize(metadata.Source)
+	vodSize, err := getVODSize(source)
 	if err == nil && vodSize > 0 {
 		var alreadyDownloaded int64
 		if fileInfo, err := os.Stat(outputPath); err == nil {
@@ -903,7 +961,7 @@ func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, 
 			logz("info", EMOJI_RECYCLE, "Retry attempt %d/%d for VOD download", attempt, *ytdlpRetries)
 		}
 
-		cmd := exec.CommandContext(ctx, "yt-dlp", "--newline", "--output", outputPath, "--write-info-json", metadata.Source)
+		cmd := exec.CommandContext(ctx, "yt-dlp", "--newline", "--output", outputPath, "--write-info-json", source)
 
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
