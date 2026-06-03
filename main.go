@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"unicode"
 	"sync/atomic"
 	"time"
 
@@ -329,7 +330,8 @@ func main() {
 	logz("ok", EMOJI_CHECK, "Metadata extracted: Title=\"%s\", Channel=%s, Views=%d, Duration=%ds",
 		metadata.Title, metadata.ChannelInfo.Username, metadata.Views, metadata.Duration)
 
-	archiveDir := filepath.Join(*outputFlag, fmt.Sprintf("%s_%s", metadata.ChannelInfo.Slug, metadata.UUID))
+	titleSlug := slugifyTitle(metadata.Title)
+	archiveDir := filepath.Join(*outputFlag, fmt.Sprintf("%s_%s", metadata.StartTime.UTC().Format("2006_01_02_15_04_05"), titleSlug))
 
 	// Handle dry run mode.
 	if *dryRun {
@@ -368,7 +370,7 @@ func main() {
 	}
 
 	// Save initial metadata to a file.
-	metadataPath := filepath.Join(archiveDir, fmt.Sprintf("vod_metadata_%s.json", metadata.UUID))
+	metadataPath := filepath.Join(archiveDir, "vod_metadata.json")
 	if err := saveJSONAtomic(metadataPath, metadata); err != nil {
 		logz("fatal", EMOJI_CROSS, "Failed to save VOD metadata: %v", err)
 	}
@@ -528,6 +530,34 @@ func logz(level string, emoji string, format string, v ...interface{}) {
 		fmt.Printf("\r\033[K")
 		logger.Fatalf("[FATAL] %s", msg)
 	}
+}
+
+// slugifyTitle converts a stream title to a safe folder-name segment.
+// Takes the part before " | ", keeps letters/digits/hyphens, converts spaces to underscores.
+func slugifyTitle(title string) string {
+	if idx := strings.Index(title, " | "); idx != -1 {
+		title = title[:idx]
+	}
+	title = strings.TrimSpace(title)
+	var b strings.Builder
+	for _, r := range title {
+		if r == ' ' {
+			b.WriteRune('_')
+		} else if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '-' || r == '_' || r == '(' || r == ')' {
+			b.WriteRune(r)
+		}
+	}
+	result := b.String()
+	for strings.Contains(result, "__") {
+		result = strings.ReplaceAll(result, "__", "_")
+	}
+	result = strings.Trim(result, "_-")
+	const maxLen = 60
+	if len([]rune(result)) > maxLen {
+		result = string([]rune(result)[:maxLen])
+		result = strings.TrimRight(result, "_-")
+	}
+	return result
 }
 
 func isValidKickURL(url string) bool {
@@ -844,7 +874,7 @@ func getVODSize(source string) (int64, error) {
 func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
 	logz("info", EMOJI_FILM, "Starting VOD download...")
 
-	outputPath := filepath.Join(archiveDir, fmt.Sprintf("vod_%s.mp4", metadata.UUID))
+	outputPath := filepath.Join(archiveDir, "vod.mp4")
 
 	// Pre-flight check for available disk space.
 	vodSize, err := getVODSize(metadata.Source)
@@ -1045,7 +1075,7 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 
 		if len(chatResp.Data.Messages) > 0 {
 			// Save each chunk of messages to a temporary part file.
-			partFile := filepath.Join(archiveDir, fmt.Sprintf("chat_%s.%d.part.json", metadata.UUID, currentTime.Unix()))
+			partFile := filepath.Join(archiveDir, fmt.Sprintf("chat.%d.part.json", currentTime.Unix()))
 			saveJSONAtomic(partFile, chatResp)
 
 			currentMsgsInRequest, currentEmotesInRequest := 0, 0
@@ -1126,14 +1156,14 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 
 // findResumePoint determines the latest timestamp from all possible sources to resume chat download.
 func findResumePoint(archiveDir string, metadata *VODMetadata, state *ProgramState) (time.Time, bool) {
-	finalChatPath := filepath.Join(archiveDir, fmt.Sprintf("chat_%s.json", metadata.UUID))
+	finalChatPath := filepath.Join(archiveDir, "chat.json")
 	finalChatTime := getLastMessageTimeFromFinalChat(finalChatPath)
 
 	stateTime := state.LastChatTime
 	if stateTime.IsZero() {
 		stateTime = metadata.StartTime
 	}
-	partFileTime := getLastMessageTimeFromPartFiles(archiveDir, metadata.UUID)
+	partFileTime := getLastMessageTimeFromPartFiles(archiveDir)
 
 	latestTime := metadata.StartTime
 	if finalChatTime.After(latestTime) {
@@ -1171,8 +1201,8 @@ func getLastMessageTimeFromFinalChat(chatPath string) time.Time {
 	return latestTime
 }
 
-func getLastMessageTimeFromPartFiles(archiveDir, uuid string) time.Time {
-	pattern := filepath.Join(archiveDir, fmt.Sprintf("chat_%s.*.part.json", uuid))
+func getLastMessageTimeFromPartFiles(archiveDir string) time.Time {
+	pattern := filepath.Join(archiveDir, "chat.*.part.json")
 	matches, _ := filepath.Glob(pattern)
 	var latestTime time.Time
 	for _, match := range matches {
@@ -1338,7 +1368,7 @@ func trackPinnedMessages(resp *ChatResponse, events *[]PinnedMessageEvent, curre
 // mergeChatFiles combines all temporary part files into a single final chat log.
 func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []PinnedMessageEvent) error {
 	logz("info", EMOJI_PAPER, "Merging chat files...")
-	matches, _ := filepath.Glob(filepath.Join(archiveDir, fmt.Sprintf("chat_%s.*.part.json", metadata.UUID)))
+	matches, _ := filepath.Glob(filepath.Join(archiveDir, "chat.*.part.json"))
 	sort.Strings(matches)
 	var allMessages []ChatMessage
 	var lastCursor string
@@ -1363,7 +1393,7 @@ func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []Pin
 	output.Stats.DownloadedEmotes = atomic.LoadInt64(&stats.TotalEmotes)
 	output.Stats.FailedEmotes = atomic.LoadInt64(&stats.FailedEmotes)
 
-	saveJSONAtomic(filepath.Join(archiveDir, fmt.Sprintf("chat_%s.json", metadata.UUID)), output)
+	saveJSONAtomic(filepath.Join(archiveDir, "chat.json"), output)
 	for _, match := range matches {
 		os.Remove(match)
 	}
@@ -1376,8 +1406,21 @@ func httpGetWithRetry(url string) (*http.Response, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	for i := 0; i < *retriesFlag; i++ {
 		req, _ := http.NewRequest("GET", url, nil)
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
+		
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+		req.Header.Set("Sec-CH-UA", `"Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99"`)
+		req.Header.Set("Sec-CH-UA-Mobile", "?0")
+		req.Header.Set("Sec-CH-UA-Platform", `"Windows"`)
+		req.Header.Set("Sec-Fetch-Dest", "document")
+		req.Header.Set("Sec-Fetch-Mode", "navigate")
+		req.Header.Set("Sec-Fetch-Site", "none")
+		req.Header.Set("Sec-Fetch-User", "?1")
+		req.Header.Set("Upgrade-Insecure-Requests", "1")
+
 		resp, err := client.Do(req)
 		if err == nil && resp.StatusCode == 200 {
 			return resp, nil
