@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -40,6 +42,9 @@ var (
 	noVOD               = flag.Bool("no-vod", false, "Skip downloading the VOD")
 	noChat              = flag.Bool("no-chat", false, "Skip downloading chat and emotes")
 	noEmotes            = flag.Bool("no-emotes", false, "Download chat but skip downloading emotes")
+	noRender            = flag.Bool("no-render", false, "Skip rendering chat to video after download")
+	tdcliPath           = flag.String("twitchdownloader-cli", "", "Path to TwitchDownloaderCLI executable (default: look next to rekick binary)")
+	renderArgs          = flag.String("render-args", "", "Extra arguments to pass to TwitchDownloaderCLI chatrender")
 	overwrite           = flag.Bool("overwrite", false, "Delete and re-create the archive directory if it exists")
 	dryRun              = flag.Bool("dry-run", false, "Show what would be downloaded without actually downloading")
 	quiet               = flag.Bool("quiet", false, "Minimal output (errors and warnings only)")
@@ -149,6 +154,7 @@ type Statistics struct {
 	VODSize              int64
 	VODDownloadDuration  time.Duration
 	ChatDownloadDuration time.Duration
+	RenderDuration       time.Duration
 	TotalMessages        int64
 	TotalEmotes          int64
 	FailedEmotes         int64
@@ -174,6 +180,8 @@ type ProgressState struct {
 	ChatEmotesInBatch string
 	VODDone           bool
 	ChatDone          bool
+	RenderStatus      string
+	RenderDone        bool
 }
 
 // ChatMessage structures for parsing API responses.
@@ -221,20 +229,125 @@ type PinnedMessageEvent struct {
 	Message    json.RawMessage `json:"message"`
 }
 
-// FinalChatOutput is the structure for the final merged chat log file.
-type FinalChatOutput struct {
-	Data struct {
-		Messages       []ChatMessage        `json:"messages"`
-		Cursor         string               `json:"cursor"`
-		PinnedMessages []PinnedMessageEvent `json:"pinned_messages"`
-	} `json:"data"`
-	Stats struct {
-		TotalMessages    int64 `json:"total_messages"`
-		TotalEmotes      int64 `json:"total_emotes"`
-		UniqueEmotes     int64 `json:"unique_emotes"`
-		DownloadedEmotes int64 `json:"downloaded_emotes"`
-		FailedEmotes     int64 `json:"failed_emotes"`
-	} `json:"stats"`
+// jsonFloat always serialises as a decimal number (e.g. 5.0, not 5),
+// matching TwitchDownloader's expected JSON format.
+type jsonFloat float64
+
+func (f jsonFloat) MarshalJSON() ([]byte, error) {
+	s := strconv.FormatFloat(float64(f), 'f', -1, 64)
+	if !strings.Contains(s, ".") {
+		s += ".0"
+	}
+	return []byte(s), nil
+}
+
+// TwitchDownloader chat JSON format structs.
+
+type TDVersion struct {
+	Major int `json:"major"`
+	Minor int `json:"minor"`
+	Patch int `json:"patch"`
+}
+
+type TDFileInfo struct {
+	Version   TDVersion `json:"Version"`
+	CreatedAt string    `json:"CreatedAt"`
+	UpdatedAt string    `json:"UpdatedAt"`
+}
+
+type TDStreamer struct {
+	Name string `json:"name"`
+	ID   int    `json:"id"`
+}
+
+type TDVideo struct {
+	Title     string    `json:"title"`
+	ID        string    `json:"id"`
+	CreatedAt string    `json:"created_at"`
+	Start     jsonFloat `json:"start"`
+	End       jsonFloat `json:"end"`
+	Length    jsonFloat `json:"length"`
+	Thumbnail *string   `json:"thumbnail"`
+}
+
+type TDCommenter struct {
+	ID          string  `json:"_id"`
+	Bio         *string `json:"bio"`
+	CreatedAt   string  `json:"created_at"`
+	DisplayName string  `json:"display_name"`
+	Logo        *string `json:"logo"`
+	Name        string  `json:"name"`
+	Type        string  `json:"type"`
+	UpdatedAt   string  `json:"updated_at"`
+}
+
+type TDEmoticon struct {
+	EmoticonID    string `json:"emoticon_id"`
+	EmoticonSetID string `json:"emoticon_set_id"`
+}
+
+type TDFragment struct {
+	Text     string      `json:"text"`
+	Emoticon *TDEmoticon `json:"emoticon"`
+}
+
+type TDEmoticonPos struct {
+	ID    string `json:"_id"`
+	Begin int    `json:"begin"`
+	End   int    `json:"end"`
+}
+
+type TDBadge struct {
+	ID      string `json:"_id"`
+	Version string `json:"version"`
+}
+
+type TDMessage struct {
+	Body             string                 `json:"body"`
+	BitsSpent        int                    `json:"bits_spent"`
+	Emoticons        []TDEmoticonPos        `json:"emoticons"`
+	Fragments        []TDFragment           `json:"fragments"`
+	UserBadges       []TDBadge              `json:"user_badges"`
+	UserColor        string                 `json:"user_color"`
+	UserNoticeParams map[string]interface{} `json:"user_notice_params"`
+}
+
+type TDComment struct {
+	ID                   string      `json:"_id"`
+	ChannelID            string      `json:"channel_id"`
+	ContentID            string      `json:"content_id"`
+	ContentOffsetSeconds jsonFloat   `json:"content_offset_seconds"`
+	ContentType          string      `json:"content_type"`
+	CreatedAt            string      `json:"created_at"`
+	UpdatedAt            string      `json:"updated_at"`
+	Commenter            TDCommenter `json:"commenter"`
+	Message              TDMessage   `json:"message"`
+}
+
+type TDEmbeddedEmote struct {
+	ID        string `json:"id"`
+	ImageType string `json:"imageType"`
+	Data      string `json:"data"`
+}
+
+type TDEmbeddedData struct {
+	ThirdParty   []TDEmbeddedEmote `json:"thirdParty"`
+	TwitchBits   []interface{}     `json:"twitchBits"`
+	TwitchBadges []interface{}     `json:"twitchBadges"`
+}
+
+type TDChatOutput struct {
+	FileInfo     TDFileInfo     `json:"FileInfo"`
+	Streamer     TDStreamer     `json:"streamer"`
+	Video        TDVideo        `json:"video"`
+	Comments     []TDComment    `json:"comments"`
+	EmbeddedData TDEmbeddedData `json:"embeddedData"`
+}
+
+// emoteIndexEntry is an internal helper for building the emote lookup table.
+type emoteIndexEntry struct {
+	FilePath string
+	Ext      string
 }
 
 // Emote structures for downloading and tracking emotes.
@@ -332,7 +445,7 @@ func main() {
 		metadata.Title, metadata.ChannelInfo.Username, metadata.Views, metadata.Duration)
 
 	titleSlug := slugifyTitle(metadata.Title)
-	archiveDir := filepath.Join(*outputFlag, fmt.Sprintf("%s_%s", metadata.StartTime.UTC().Format("2006_01_02_15_04_05"), titleSlug))
+	archiveDir := filepath.Join(*outputFlag, "streams", fmt.Sprintf("%s_%s", metadata.StartTime.UTC().Format("2006_01_02_15_04_05"), titleSlug))
 
 	// Handle dry run mode.
 	if *dryRun {
@@ -428,6 +541,18 @@ func main() {
 			if err := processChatAndEmotes(ctx, archiveDir, metadata, state, &progressState); err != nil {
 				logz("error", EMOJI_CROSS, "Chat/Emote processing failed: %v", err)
 				chatErr = err
+			} else if !*noRender {
+				stats.mu.Lock()
+				stats.ChatDownloadDuration = time.Since(startTime)
+				stats.mu.Unlock()
+				renderStart := time.Now()
+				if err := runChatRender(ctx, archiveDir, &progressState); err != nil {
+					logz("warn", EMOJI_WARN, "Chat render failed: %v", err)
+				}
+				stats.mu.Lock()
+				stats.RenderDuration = time.Since(renderStart)
+				stats.mu.Unlock()
+				return
 			}
 			stats.mu.Lock()
 			stats.ChatDownloadDuration = time.Since(startTime)
@@ -437,6 +562,7 @@ func main() {
 		chatCompleted = true
 		progressState.mu.Lock()
 		progressState.ChatDone = true
+		progressState.RenderDone = true // no chat means no render
 		progressState.mu.Unlock()
 		if state.ChatComplete {
 			logz("info", EMOJI_SKIP, "Chat already complete, skipping")
@@ -1142,8 +1268,7 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 					seenMessages[msg.ID] = true
 					currentMsgsInRequest++
 					if !*noEmotes {
-						re := regexp.MustCompile(`\[emote:(\d+):([a-zA-Z0-9]+)\]`)
-						matches := re.FindAllStringSubmatch(msg.Content, -1)
+						matches := kickEmoteRe.FindAllStringSubmatch(msg.Content, -1)
 						currentEmotesInRequest += len(matches)
 						extractEmotes(msg.Content, seenEmotes, emoteTasks)
 					}
@@ -1243,17 +1368,24 @@ func getLastMessageTimeFromFinalChat(chatPath string) time.Time {
 	if err != nil {
 		return time.Time{}
 	}
-	var finalChat FinalChatOutput
-	if err := json.Unmarshal(data, &finalChat); err != nil {
+	var tdChat TDChatOutput
+	if err := json.Unmarshal(data, &tdChat); err != nil {
 		return time.Time{}
 	}
-	if len(finalChat.Data.Messages) == 0 {
+	if len(tdChat.Comments) == 0 {
 		return time.Time{}
 	}
 	var latestTime time.Time
-	for _, msg := range finalChat.Data.Messages {
-		if msg.CreatedAt.After(latestTime) {
-			latestTime = msg.CreatedAt
+	for _, c := range tdChat.Comments {
+		t, err := time.Parse("2006-01-02T15:04:05Z", c.CreatedAt)
+		if err != nil {
+			t, err = time.Parse(time.RFC3339, c.CreatedAt)
+			if err != nil {
+				continue
+			}
+		}
+		if t.After(latestTime) {
+			latestTime = t
 		}
 	}
 	return latestTime
@@ -1277,9 +1409,102 @@ func getLastMessageTimeFromPartFiles(archiveDir string) time.Time {
 	return latestTime
 }
 
+var kickEmoteRe = regexp.MustCompile(`\[emote:(\d+):([a-zA-Z0-9_]+)\]`)
+
+// parseKickContent converts a Kick message content string into TwitchDownloader
+// body text, fragment list, emoticon position list, and the set of emote IDs used.
+func parseKickContent(content string) (body string, fragments []TDFragment, emoticons []TDEmoticonPos, usedIDs map[string]bool) {
+	usedIDs = make(map[string]bool)
+	var bodyParts []string
+	bodyOffset := 0
+	pos := 0
+
+	for _, idx := range kickEmoteRe.FindAllStringSubmatchIndex(content, -1) {
+		before := content[pos:idx[0]]
+		emoteID := content[idx[2]:idx[3]]
+		emoteName := content[idx[4]:idx[5]]
+
+		if before != "" {
+			fragments = append(fragments, TDFragment{Text: before})
+			bodyParts = append(bodyParts, before)
+			bodyOffset += len([]rune(before))
+		}
+
+		fragments = append(fragments, TDFragment{
+			Text:     emoteName,
+			Emoticon: &TDEmoticon{EmoticonID: emoteID},
+		})
+		emoticons = append(emoticons, TDEmoticonPos{
+			ID:    emoteID,
+			Begin: bodyOffset,
+			End:   bodyOffset + len([]rune(emoteName)),
+		})
+		bodyParts = append(bodyParts, emoteName)
+		bodyOffset += len([]rune(emoteName))
+		usedIDs[emoteID] = true
+		pos = idx[1]
+	}
+
+	tail := content[pos:]
+	if tail != "" {
+		fragments = append(fragments, TDFragment{Text: tail})
+		bodyParts = append(bodyParts, tail)
+	}
+
+	body = strings.Join(bodyParts, "")
+	return
+}
+
+func convertKickBadges(badges []Badge) []TDBadge {
+	result := []TDBadge{}
+	for _, b := range badges {
+		version := "1"
+		if (b.Type == "subscriber" || b.Type == "sub_gifter") && b.Count > 0 {
+			version = strconv.Itoa(b.Count)
+		}
+		result = append(result, TDBadge{ID: b.Type, Version: version})
+	}
+	return result
+}
+
+// buildEmoteIndex builds a lookup from emote ID to file info using the saved emotes.json DB.
+func buildEmoteIndex(archiveDir string) map[string]emoteIndexEntry {
+	index := make(map[string]emoteIndexEntry)
+	db := loadEmoteDatabase(archiveDir)
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	for id, meta := range db.Emotes {
+		if len(meta.Versions) == 0 {
+			continue
+		}
+		ver := meta.Versions[len(meta.Versions)-1]
+		ext := strings.TrimPrefix(filepath.Ext(ver.FilePath), ".")
+		index[id] = emoteIndexEntry{
+			FilePath: filepath.Join(archiveDir, ver.FilePath),
+			Ext:      ext,
+		}
+	}
+	return index
+}
+
+func loadEmoteDataForEmbed(emoteID string, index map[string]emoteIndexEntry) *TDEmbeddedEmote {
+	entry, ok := index[emoteID]
+	if !ok {
+		return nil
+	}
+	data, err := os.ReadFile(entry.FilePath)
+	if err != nil {
+		return nil
+	}
+	return &TDEmbeddedEmote{
+		ID:        emoteID,
+		ImageType: entry.Ext,
+		Data:      base64.StdEncoding.EncodeToString(data),
+	}
+}
+
 func extractEmotes(content string, seen map[string]bool, tasks chan EmoteTask) {
-	re := regexp.MustCompile(`\[emote:(\d+):([a-zA-Z0-9]+)\]`)
-	for _, match := range re.FindAllStringSubmatch(content, -1) {
+	for _, match := range kickEmoteRe.FindAllStringSubmatch(content, -1) {
 		key := match[1] + ":" + match[2]
 		if !seen[key] {
 			seen[key] = true
@@ -1423,40 +1648,221 @@ func trackPinnedMessages(resp *ChatResponse, events *[]PinnedMessageEvent, curre
 	}
 }
 
-// mergeChatFiles combines all temporary part files into a single final chat log.
+// mergeChatFiles combines all temporary part files into a single chat.json
+// in TwitchDownloader format with emotes embedded as base64.
 func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []PinnedMessageEvent) error {
 	logz("info", EMOJI_PAPER, "Merging chat files...")
 	matches, _ := filepath.Glob(filepath.Join(archiveDir, "chat.*.part.json"))
 	sort.Strings(matches)
+
+	// Collect and deduplicate messages from all part files.
+	seen := make(map[string]bool)
 	var allMessages []ChatMessage
-	var lastCursor string
-	uniqueEmotes := make(map[string]bool)
 	for _, match := range matches {
 		data, _ := os.ReadFile(match)
 		var resp ChatResponse
 		if json.Unmarshal(data, &resp) == nil {
-			allMessages = append(allMessages, resp.Data.Messages...)
-			lastCursor = resp.Data.Cursor
 			for _, msg := range resp.Data.Messages {
-				re := regexp.MustCompile(`\[emote:(\d+):([a-zA-Z0-9]+)\]`)
-				for _, emMatch := range re.FindAllStringSubmatch(msg.Content, -1) {
-					uniqueEmotes[emMatch[1]+":"+emMatch[2]] = true
+				if !seen[msg.ID] {
+					seen[msg.ID] = true
+					allMessages = append(allMessages, msg)
 				}
 			}
 		}
 	}
-	output := FinalChatOutput{}
-	output.Data.Messages, output.Data.Cursor, output.Data.PinnedMessages = allMessages, lastCursor, pinnedEvents
-	output.Stats.TotalMessages, output.Stats.UniqueEmotes = int64(len(allMessages)), int64(len(uniqueEmotes))
-	output.Stats.DownloadedEmotes = atomic.LoadInt64(&stats.TotalEmotes)
-	output.Stats.FailedEmotes = atomic.LoadInt64(&stats.FailedEmotes)
 
-	saveJSONAtomic(filepath.Join(archiveDir, "chat.json"), output)
+	sort.Slice(allMessages, func(i, j int) bool {
+		return allMessages[i].CreatedAt.Before(allMessages[j].CreatedAt)
+	})
+
+	emoteIndex := buildEmoteIndex(archiveDir)
+	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	streamStart := metadata.StartTime.UTC()
+	allUsedEmoteIDs := make(map[string]bool)
+	comments := []TDComment{}
+
+	for _, msg := range allMessages {
+		if msg.Type == "celebration" {
+			continue
+		}
+
+		body, fragments, emoticons, usedIDs := parseKickContent(msg.Content)
+		for id := range usedIDs {
+			allUsedEmoteIDs[id] = true
+		}
+
+		offsetSeconds := msg.CreatedAt.Sub(streamStart).Seconds()
+		if offsetSeconds < 0 {
+			offsetSeconds = 0
+		}
+
+		username := msg.Sender.Username
+		if username == "" {
+			username = msg.Sender.Slug
+		}
+		userColor := msg.Sender.Identity.Color
+		if userColor == "" {
+			userColor = "#FFFFFF"
+		}
+		createdAtStr := msg.CreatedAt.UTC().Format("2006-01-02T15:04:05Z")
+
+		if emoticons == nil {
+			emoticons = []TDEmoticonPos{}
+		}
+		if fragments == nil {
+			fragments = []TDFragment{}
+		}
+
+		comments = append(comments, TDComment{
+			ID:                   msg.ID,
+			ChannelID:            strconv.Itoa(metadata.ChannelInfo.ID),
+			ContentID:            metadata.UUID,
+			ContentOffsetSeconds: jsonFloat(math.Round(offsetSeconds*1000) / 1000),
+			ContentType:          "video",
+			CreatedAt:            createdAtStr,
+			UpdatedAt:            createdAtStr,
+			Commenter: TDCommenter{
+				ID:          strconv.Itoa(msg.UserID),
+				CreatedAt:   "2000-01-01T00:00:00Z",
+				DisplayName: username,
+				Name:        strings.ToLower(username),
+				Type:        "user",
+				UpdatedAt:   "2000-01-01T00:00:00Z",
+			},
+			Message: TDMessage{
+				Body:             body,
+				Emoticons:        emoticons,
+				Fragments:        fragments,
+				UserBadges:       convertKickBadges(msg.Sender.Identity.Badges),
+				UserColor:        userColor,
+				UserNoticeParams: map[string]interface{}{},
+			},
+		})
+	}
+
+	// Embed all emotes used in the chat as base64.
+	thirdParty := []TDEmbeddedEmote{}
+	for emoteID := range allUsedEmoteIDs {
+		if entry := loadEmoteDataForEmbed(emoteID, emoteIndex); entry != nil {
+			thirdParty = append(thirdParty, *entry)
+		}
+	}
+	sort.Slice(thirdParty, func(i, j int) bool { return thirdParty[i].ID < thirdParty[j].ID })
+
+	output := TDChatOutput{
+		FileInfo: TDFileInfo{
+			Version:   TDVersion{Major: 1, Minor: 3, Patch: 0},
+			CreatedAt: nowStr,
+			UpdatedAt: nowStr,
+		},
+		Streamer: TDStreamer{
+			Name: metadata.ChannelInfo.Username,
+			ID:   metadata.ChannelInfo.ID,
+		},
+		Video: TDVideo{
+			Title:     metadata.Title,
+			ID:        metadata.UUID,
+			CreatedAt: metadata.StartTime.UTC().Format("2006-01-02T15:04:05Z"),
+			Start:  0.0,
+			End:    jsonFloat(metadata.Duration),
+			Length: jsonFloat(metadata.Duration),
+		},
+		Comments: comments,
+		EmbeddedData: TDEmbeddedData{
+			ThirdParty:   thirdParty,
+			TwitchBits:   []interface{}{},
+			TwitchBadges: []interface{}{},
+		},
+	}
+
+	if err := saveJSONAtomic(filepath.Join(archiveDir, "chat.json"), output); err != nil {
+		return err
+	}
 	for _, match := range matches {
 		os.Remove(match)
 	}
 
-	logz("ok", EMOJI_CHECK, "Merged %d messages into final chat file", len(allMessages))
+	logz("ok", EMOJI_CHECK, "Merged %d messages into chat.json (TwitchDownloader format, %d emotes embedded)",
+		len(comments), len(thirdParty))
+	return nil
+}
+
+func findTwitchDownloaderCLI() string {
+	if *tdcliPath != "" {
+		return *tdcliPath
+	}
+	// Look in the same directory as the running binary.
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, name := range []string{"TwitchDownloaderCLI.exe", "TwitchDownloaderCLI"} {
+			candidate := filepath.Join(dir, name)
+			if _, err := os.Stat(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	// Fall back to PATH.
+	if p, err := exec.LookPath("TwitchDownloaderCLI"); err == nil {
+		return p
+	}
+	return ""
+}
+
+func runChatRender(ctx context.Context, archiveDir string, progressState *ProgressState) error {
+	tdcli := findTwitchDownloaderCLI()
+	if tdcli == "" {
+		return fmt.Errorf("TwitchDownloaderCLI not found; place it next to rekick or use --twitchdownloader-cli")
+	}
+
+	chatJSON := filepath.Join(archiveDir, "chat.json")
+	outputPath := filepath.Join(archiveDir, "chat.mp4")
+
+	args := []string{"chatrender", "-i", chatJSON, "-o", outputPath}
+	if *renderArgs != "" {
+		args = append(args, strings.Fields(*renderArgs)...)
+	}
+
+	logz("info", EMOJI_PAINT, "Starting chat render: %s", tdcli)
+	progressState.mu.Lock()
+	progressState.RenderStatus = "Starting..."
+	progressState.mu.Unlock()
+
+	cmd := exec.CommandContext(ctx, tdcli, args...)
+	stdout, _ := cmd.StdoutPipe()
+	stderr, _ := cmd.StderrPipe()
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start TwitchDownloaderCLI: %v", err)
+	}
+
+	scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		logz("debug", EMOJI_BUG, "[render] %s", line)
+		if strings.Contains(line, "%") || strings.Contains(strings.ToLower(line), "status") ||
+			strings.Contains(strings.ToLower(line), "rendering") || strings.Contains(strings.ToLower(line), "writing") {
+			progressState.mu.Lock()
+			progressState.RenderStatus = line
+			progressState.mu.Unlock()
+		}
+	}
+
+	if err := cmd.Wait(); err != nil {
+		progressState.mu.Lock()
+		progressState.RenderStatus = "Failed"
+		progressState.mu.Unlock()
+		return fmt.Errorf("TwitchDownloaderCLI exited with error: %v", err)
+	}
+
+	progressState.mu.Lock()
+	progressState.RenderStatus = ""
+	progressState.RenderDone = true
+	progressState.mu.Unlock()
+
+	logz("ok", EMOJI_CHECK, "Chat render complete: %s", outputPath)
 	return nil
 }
 
@@ -1549,7 +1955,7 @@ func printStatistics(vodComplete, chatComplete bool, vodErr, chatErr error) {
 	logz("info", EMOJI_CLOCK, "Total Time: %s", formatDuration(duration))
 
 	stats.mu.Lock()
-	vodDuration, chatDuration := stats.VODDownloadDuration, stats.ChatDownloadDuration
+	vodDuration, chatDuration, renderDuration := stats.VODDownloadDuration, stats.ChatDownloadDuration, stats.RenderDuration
 	stats.mu.Unlock()
 
 	vodSize := atomic.LoadInt64(&stats.VODSize)
@@ -1569,6 +1975,10 @@ func printStatistics(vodComplete, chatComplete bool, vodErr, chatErr error) {
 			logz("info", "", "   - Total Messages: %d (Avg %.2f msgs/s)", totalMsgs, msgsPerSec)
 		}
 		logz("info", "", "   - Emotes Downloaded: %d (failed: %d)", atomic.LoadInt64(&stats.TotalEmotes), atomic.LoadInt64(&stats.FailedEmotes))
+	}
+
+	if renderDuration > 0 {
+		logz("info", EMOJI_PAINT, "Chat Render Time: %s", formatDuration(renderDuration))
 	}
 
 	if apiCalls := atomic.LoadInt64(&stats.APICalls); apiCalls > 0 {
@@ -1643,7 +2053,7 @@ func renderProgress(ctx context.Context, state *ProgressState, wg *sync.WaitGrou
 			return
 		case <-ticker.C:
 			state.mu.Lock()
-			done := state.VODDone && state.ChatDone
+			done := state.VODDone && state.ChatDone && (*noRender || state.RenderDone)
 			state.mu.Unlock()
 			printProgressLine(state)
 			if done {
@@ -1682,6 +2092,11 @@ func printProgressLine(state *ProgressState) {
 
 	if state.ChatDone {
 		chatPart = fmt.Sprintf("%s: %s Complete", chatEmoji, EMOJI_CHECK)
+		if state.RenderDone {
+			chatPart += fmt.Sprintf(" | %s Render complete", EMOJI_CHECK)
+		} else if state.RenderStatus != "" {
+			chatPart += fmt.Sprintf(" | %s %s", EMOJI_PAINT, state.RenderStatus)
+		}
 		chatPercentVal = 100.0
 	} else if state.ChatPercent == "" {
 		chatPart = fmt.Sprintf("%s: Starting...", chatEmoji)
@@ -1740,11 +2155,11 @@ func renderSimpleProgress(ctx context.Context, state *ProgressState, wg *sync.Wa
 			return
 		case <-ticker.C:
 			state.mu.Lock()
-			done := state.VODDone && state.ChatDone
+			done := state.VODDone && state.ChatDone && (*noRender || state.RenderDone)
 			state.mu.Unlock()
 			printSimpleProgressLine(state)
 			if done {
-				fmt.Println() // Print a final newline
+				fmt.Println()
 				return
 			}
 		}
@@ -1769,6 +2184,11 @@ func printSimpleProgressLine(state *ProgressState) {
 
 	if state.ChatDone {
 		chatPart = "Chat: Complete"
+		if state.RenderDone {
+			chatPart += " | Render: Complete"
+		} else if state.RenderStatus != "" {
+			chatPart += " | Render: " + state.RenderStatus
+		}
 	} else if state.ChatPercent == "" {
 		chatPart = "Chat: Starting..."
 	} else {
