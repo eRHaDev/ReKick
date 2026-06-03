@@ -1808,6 +1808,40 @@ func findTwitchDownloaderCLI() string {
 	return ""
 }
 
+// scanCRLF is a bufio.SplitFunc that splits on \n, \r\n, or bare \r,
+// so we can read TwitchDownloaderCLI's \r-only progress updates in real time.
+func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
+	}
+	for i, b := range data {
+		if b == '\n' {
+			end := i
+			if end > 0 && data[end-1] == '\r' {
+				end--
+			}
+			return i + 1, data[:end], nil
+		}
+		if b == '\r' {
+			if i+1 < len(data) {
+				if data[i+1] == '\n' {
+					return i + 2, data[:i], nil
+				}
+				return i + 1, data[:i], nil
+			}
+			if atEOF {
+				return i + 1, data[:i], nil
+			}
+			// need more data to know if \r\n
+			return 0, nil, nil
+		}
+	}
+	if atEOF {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
+}
+
 func runChatRender(ctx context.Context, archiveDir string, progressState *ProgressState) error {
 	tdcli := findTwitchDownloaderCLI()
 	if tdcli == "" {
@@ -1835,20 +1869,34 @@ func runChatRender(ctx context.Context, archiveDir string, progressState *Progre
 		return fmt.Errorf("failed to start TwitchDownloaderCLI: %v", err)
 	}
 
-	scanner := bufio.NewScanner(io.MultiReader(stdout, stderr))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		logz("debug", EMOJI_BUG, "[render] %s", line)
-		if strings.Contains(line, "%") || strings.Contains(strings.ToLower(line), "status") ||
-			strings.Contains(strings.ToLower(line), "rendering") || strings.Contains(strings.ToLower(line), "writing") {
-			progressState.mu.Lock()
-			progressState.RenderStatus = line
-			progressState.mu.Unlock()
+	// Drain stdout and stderr concurrently — sequential MultiReader can deadlock
+	// when the process writes to the other pipe while we're blocked on this one.
+	handlePipe := func(r io.Reader, wg *sync.WaitGroup) {
+		defer wg.Done()
+		scanner := bufio.NewScanner(r)
+		scanner.Split(scanCRLF)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			logz("debug", EMOJI_BUG, "[render] %s", line)
+			low := strings.ToLower(line)
+			if strings.Contains(line, "%") || strings.Contains(low, "status") ||
+				strings.Contains(low, "rendering") || strings.Contains(low, "writing") ||
+				strings.Contains(low, "fetching") {
+				progressState.mu.Lock()
+				progressState.RenderStatus = line
+				progressState.mu.Unlock()
+			}
 		}
 	}
+
+	var pipeWg sync.WaitGroup
+	pipeWg.Add(2)
+	go handlePipe(stdout, &pipeWg)
+	go handlePipe(stderr, &pipeWg)
+	pipeWg.Wait()
 
 	if err := cmd.Wait(); err != nil {
 		progressState.mu.Lock()
