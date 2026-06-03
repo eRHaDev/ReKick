@@ -53,6 +53,7 @@ var (
 	logFile             = flag.String("log-file", "", "Optional path to a file for log output")
 	noEmoji             = flag.Bool("no-emoji", false, "Disable emoji characters in log output for older terminals")
 	simpleProgress      = flag.Bool("simple-progress", false, "Use a simple, single-line progress display without bars")
+	cookiesFlag         = flag.String("cookies", "", "Cookie header value from a logged-in kick.com browser session (required for subscriber-only VODs, e.g. \"kick_session=abc; XSRF-TOKEN=xyz\")")
 )
 
 // Logging levels
@@ -1004,9 +1005,102 @@ func getVODSize(source string) (int64, error) {
 	return maxSize, nil
 }
 
+// fetchShortVideoID calls the Kick videos API to find the short alphanumeric IVS recording ID
+// for the given VOD UUID. The short ID (e.g. "HR2nyilaQvqt") is the real last path segment in
+// CDN URLs — the UUID is NOT used there. It is embedded in the images.kick.com thumbnail URL:
+//   https://images.kick.com/video_thumbnails/{ivsChannelID}/{shortID}/720.webp
+// If the API returns a populated source URL (public VODs), that is returned via sourceOut instead.
+func fetchShortVideoID(channelSlug, targetUUID string) (shortID string, sourceOut string, err error) {
+	type thumbObj struct {
+		Src string `json:"src"`
+	}
+	// The v2 videos API nests the UUID under a "video" sub-object.
+	type nestedVideo struct {
+		UUID string `json:"uuid"`
+	}
+	type apiVideo struct {
+		UUID      string      `json:"uuid"`       // sometimes top-level
+		Video     nestedVideo `json:"video"`       // sometimes nested
+		Source    string      `json:"source"`
+		Thumbnail thumbObj    `json:"thumbnail"`
+	}
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	for page := 1; page <= 15; page++ {
+		apiURL := fmt.Sprintf("https://kick.com/api/v2/channels/%s/videos?page=%d&limit=20", channelSlug, page)
+		req, _ := http.NewRequest("GET", apiURL, nil)
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+		req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+		req.Header.Set("Referer", "https://kick.com/"+channelSlug)
+		req.Header.Set("Origin", "https://kick.com")
+		req.Header.Set("sec-ch-ua", `"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"`)
+		req.Header.Set("sec-ch-ua-mobile", "?0")
+		req.Header.Set("sec-ch-ua-platform", `"Windows"`)
+		req.Header.Set("Sec-Fetch-Dest", "empty")
+		req.Header.Set("Sec-Fetch-Mode", "cors")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		if *cookiesFlag != "" {
+			req.Header.Set("Cookie", *cookiesFlag)
+		}
+
+		resp, err2 := client.Do(req)
+		if err2 != nil {
+			return "", "", fmt.Errorf("API request failed: %v", err2)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		logz("debug", EMOJI_BUG, "Videos API page %d status: %d", page, resp.StatusCode)
+		if resp.StatusCode != 200 {
+			return "", "", fmt.Errorf("videos API returned %d", resp.StatusCode)
+		}
+
+		var videos []apiVideo
+		if err2 := json.Unmarshal(body, &videos); err2 != nil {
+			return "", "", fmt.Errorf("failed to parse videos API response: %v", err2)
+		}
+		if len(videos) == 0 {
+			break
+		}
+
+		for _, v := range videos {
+			// UUID may be at top level or nested under "video".
+			uuid := v.UUID
+			if uuid == "" {
+				uuid = v.Video.UUID
+			}
+			logz("debug", EMOJI_BUG, "API video uuid=%s source=%s thumb=%s", uuid, v.Source[:min(len(v.Source), 60)], v.Thumbnail.Src)
+			if uuid != targetUUID {
+				continue
+			}
+			// Public VOD: source field is already populated — use it directly.
+			if v.Source != "" {
+				return "", v.Source, nil
+			}
+			// Sub-only VOD: extract short ID from images.kick.com thumbnail.
+			// URL format: https://images.kick.com/video_thumbnails/{ivsChannelID}/{shortID}/720.webp
+			thumbURL := v.Thumbnail.Src
+			if strings.Contains(thumbURL, "images.kick.com/video_thumbnails/") {
+				parts := strings.Split(thumbURL, "/")
+				// ["https:", "", "images.kick.com", "video_thumbnails", ivsChannelID, shortID, ...]
+				if len(parts) >= 6 {
+					sid := parts[5]
+					logz("debug", EMOJI_BUG, "Extracted short video ID from thumbnail: %s", sid)
+					return sid, "", nil
+				}
+			}
+			return "", "", fmt.Errorf("could not extract short ID from thumbnail URL: %s", thumbURL)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return "", "", fmt.Errorf("VOD UUID %s not found in channel videos API", targetUUID)
+}
+
 // resolveVODSource returns the HLS source URL for the VOD.
-// For sub-only VODs the "source" field is empty, so it probes Kick's CDN directly
-// by reconstructing the IVS path from the thumbnail URL (technique from KickNoSub).
+// For sub-only VODs the "source" field is empty in the HTML page. The real CDN URL uses
+// a short alphanumeric IVS recording ID (not the UUID) that is only available from the
+// videos API via the images.kick.com thumbnail URL.
 func resolveVODSource(metadata *VODMetadata) (string, error) {
 	if metadata.Source != "" {
 		return metadata.Source, nil
@@ -1014,19 +1108,30 @@ func resolveVODSource(metadata *VODMetadata) (string, error) {
 	if metadata.IVSChannelID == "" {
 		return "", fmt.Errorf("sub-only VOD: IVS channel ID unavailable")
 	}
+
+	logz("info", EMOJI_RECYCLE, "Source URL empty (sub-only VOD), fetching short video ID from API...")
+	shortID, directSource, err := fetchShortVideoID(metadata.ChannelInfo.Slug, metadata.UUID)
+	if err != nil {
+		logz("warn", EMOJI_WARN, "API lookup failed (%v), falling back to UUID-based CDN probe", err)
+		shortID = metadata.UUID
+	}
+	if directSource != "" {
+		logz("ok", EMOJI_CHECK, "Got source URL directly from API")
+		return directSource, nil
+	}
+
 	ivsChannelID := metadata.IVSChannelID
 	bases := []string{
 		"https://stream.kick.com/ivs/v1/196233775518",
 		"https://stream.kick.com/3c81249a5ce0/ivs/v1/196233775518",
 		"https://stream.kick.com/0f3cb0ebce7/ivs/v1/196233775518",
 	}
-	logz("info", EMOJI_RECYCLE, "Source URL empty (sub-only VOD), probing CDN paths...")
 	t := metadata.StartTime.UTC()
 	for offset := -5; offset <= 5; offset++ {
 		adj := t.Add(time.Duration(offset) * time.Minute)
 		for _, base := range bases {
 			u := fmt.Sprintf("%s/%s/%d/%d/%d/%d/%d/%s/media/hls/master.m3u8",
-				base, ivsChannelID, adj.Year(), int(adj.Month()), adj.Day(), adj.Hour(), adj.Minute(), metadata.UUID)
+				base, ivsChannelID, adj.Year(), int(adj.Month()), adj.Day(), adj.Hour(), adj.Minute(), shortID)
 			logz("debug", EMOJI_BUG, "Probing CDN: %s", u)
 			resp, err := httpHeadOnce(u)
 			if err == nil && resp.StatusCode == 200 {
@@ -1039,13 +1144,16 @@ func resolveVODSource(metadata *VODMetadata) (string, error) {
 			}
 		}
 	}
-	return "", fmt.Errorf("could not locate CDN stream URL within ±5min of start time")
+	return "", fmt.Errorf("could not locate CDN stream URL (shortID=%s) within ±5min of start time", shortID)
 }
 
 func httpHeadOnce(url string) (*http.Response, error) {
 	client := &http.Client{Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("HEAD", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	if *cookiesFlag != "" {
+		req.Header.Set("Cookie", *cookiesFlag)
+	}
 	return client.Do(req)
 }
 
@@ -1087,7 +1195,12 @@ func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, 
 			logz("info", EMOJI_RECYCLE, "Retry attempt %d/%d for VOD download", attempt, *ytdlpRetries)
 		}
 
-		cmd := exec.CommandContext(ctx, "yt-dlp", "--newline", "--output", outputPath, "--write-info-json", source)
+		ytdlpArgs := []string{"--newline", "--output", outputPath, "--write-info-json"}
+		if *cookiesFlag != "" {
+			ytdlpArgs = append(ytdlpArgs, "--add-header", "Cookie:"+*cookiesFlag)
+		}
+		ytdlpArgs = append(ytdlpArgs, source)
+		cmd := exec.CommandContext(ctx, "yt-dlp", ytdlpArgs...)
 
 		stdout, _ := cmd.StdoutPipe()
 		stderr, _ := cmd.StderrPipe()
