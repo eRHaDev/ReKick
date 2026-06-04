@@ -29,6 +29,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+	"golang.org/x/text/transform"
+	"golang.org/x/text/unicode/norm"
 )
 
 // CLI flags
@@ -661,12 +663,19 @@ func logz(level string, emoji string, format string, v ...interface{}) {
 }
 
 // slugifyTitle converts a stream title to a safe folder-name segment.
-// Takes the part before " | ", keeps letters/digits/hyphens, converts spaces to underscores.
+// Takes the part before " | ", strips accents, keeps letters/digits/hyphens, converts spaces to underscores.
 func slugifyTitle(title string) string {
 	if idx := strings.Index(title, " | "); idx != -1 {
 		title = title[:idx]
 	}
 	title = strings.TrimSpace(title)
+	// NFD-decompose then drop non-spacing marks to strip accents (á→a, č→c, etc.)
+	t := transform.Chain(norm.NFD, transform.RemoveFunc(func(r rune) bool {
+		return unicode.Is(unicode.Mn, r)
+	}))
+	if stripped, _, err := transform.String(t, title); err == nil {
+		title = stripped
+	}
 	var b strings.Builder
 	for _, r := range title {
 		if r == ' ' {
@@ -1601,6 +1610,9 @@ func buildEmoteIndex(archiveDir string) map[string]emoteIndexEntry {
 }
 
 func loadEmoteDataForEmbed(emoteID string, index map[string]emoteIndexEntry) *TDEmbeddedEmote {
+	if emoteID == "" {
+		return nil
+	}
 	entry, ok := index[emoteID]
 	if !ok {
 		return nil
