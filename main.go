@@ -472,6 +472,14 @@ func main() {
 		logz("fatal", EMOJI_CROSS, "Failed to create archive directory: %v", err)
 	}
 
+	vodDir := filepath.Join(archiveDir, "vod")
+	chatDir := filepath.Join(archiveDir, "chat")
+	for _, d := range []string{vodDir, chatDir} {
+		if err := os.MkdirAll(d, 0755); err != nil {
+			logz("fatal", EMOJI_CROSS, "Failed to create subdirectory %s: %v", d, err)
+		}
+	}
+
 	// Load previous state for resuming or start fresh.
 	state, isResuming := loadState(archiveDir, metadata)
 	if isResuming {
@@ -515,7 +523,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			startTime := time.Now()
-			if err := downloadVOD(ctx, archiveDir, metadata, state, &progressState); err != nil {
+			if err := downloadVOD(ctx, archiveDir, vodDir, metadata, state, &progressState); err != nil {
 				logz("error", EMOJI_CROSS, "VOD download failed: %v", err)
 				vodErr = err
 			} else {
@@ -541,7 +549,7 @@ func main() {
 		go func() {
 			defer wg.Done()
 			startTime := time.Now()
-			if err := processChatAndEmotes(ctx, archiveDir, metadata, state, &progressState); err != nil {
+			if err := processChatAndEmotes(ctx, archiveDir, chatDir, metadata, state, &progressState); err != nil {
 				logz("error", EMOJI_CROSS, "Chat/Emote processing failed: %v", err)
 				chatErr = err
 			} else if !*noRender {
@@ -549,7 +557,7 @@ func main() {
 				stats.ChatDownloadDuration = time.Since(startTime)
 				stats.mu.Unlock()
 				renderStart := time.Now()
-				if err := runChatRender(ctx, archiveDir, &progressState); err != nil {
+				if err := runChatRender(ctx, chatDir, &progressState); err != nil {
 					logz("warn", EMOJI_WARN, "Chat render failed: %v", err)
 				}
 				stats.mu.Lock()
@@ -1167,10 +1175,10 @@ func httpHeadOnce(url string) (*http.Response, error) {
 }
 
 // downloadVOD handles the entire VOD download process using yt-dlp.
-func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
+func downloadVOD(ctx context.Context, archiveDir string, vodDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
 	logz("info", EMOJI_FILM, "Starting VOD download...")
 
-	outputPath := filepath.Join(archiveDir, "vod.mp4")
+	outputPath := filepath.Join(vodDir, "vod.mp4")
 
 	source, err := resolveVODSource(metadata)
 	if err != nil {
@@ -1296,8 +1304,8 @@ func downloadVOD(ctx context.Context, archiveDir string, metadata *VODMetadata, 
 }
 
 // processChatAndEmotes manages the entire chat and emote download lifecycle.
-func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
-	resumeTime, isResuming := findResumePoint(archiveDir, metadata, state)
+func processChatAndEmotes(ctx context.Context, archiveDir string, chatDir string, metadata *VODMetadata, state *ProgramState, progressState *ProgressState) error {
+	resumeTime, isResuming := findResumePoint(archiveDir, chatDir, metadata, state)
 	if isResuming {
 		logz("info", EMOJI_RECYCLE, "Resuming from: %s", resumeTime.Format(time.RFC3339))
 	} else {
@@ -1310,14 +1318,14 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 	var emoteResults chan *EmoteMetadata
 	var emoteWg sync.WaitGroup
 	if !*noEmotes {
-		emoteDB = loadEmoteDatabase(archiveDir)
+		emoteDB = loadEmoteDatabase(chatDir)
 		emoteTasks = make(chan EmoteTask, 100)
 		emoteResults = make(chan *EmoteMetadata, 100)
 		for i := 0; i < *maxConcurrentEmotes; i++ {
 			emoteWg.Add(1)
-			go emoteWorker(ctx, archiveDir, emoteTasks, emoteResults, &emoteWg, emoteDB)
+			go emoteWorker(ctx, chatDir, emoteTasks, emoteResults, &emoteWg, emoteDB)
 		}
-		go emoteMetadataSaver(ctx, archiveDir, emoteDB, emoteResults)
+		go emoteMetadataSaver(ctx, chatDir, emoteDB, emoteResults)
 	}
 
 	var pinnedEvents []PinnedMessageEvent
@@ -1342,7 +1350,7 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 				close(emoteResults)
 				time.Sleep(time.Second)
 			}
-			return mergeChatFiles(archiveDir, metadata, pinnedEvents)
+			return mergeChatFiles(chatDir, metadata, pinnedEvents)
 		default:
 		}
 
@@ -1381,7 +1389,7 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 
 		if len(chatResp.Data.Messages) > 0 {
 			// Save each chunk of messages to a temporary part file.
-			partFile := filepath.Join(archiveDir, fmt.Sprintf("chat.%d.part.json", currentTime.Unix()))
+			partFile := filepath.Join(chatDir, fmt.Sprintf("chat.%d.part.json", currentTime.Unix()))
 			saveJSONAtomic(partFile, chatResp)
 
 			currentMsgsInRequest, currentEmotesInRequest := 0, 0
@@ -1445,7 +1453,7 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 	}
 
 	// Merge all temporary chat files into one final JSON file.
-	if err := mergeChatFiles(archiveDir, metadata, pinnedEvents); err != nil {
+	if err := mergeChatFiles(chatDir, metadata, pinnedEvents); err != nil {
 		return err
 	}
 
@@ -1460,15 +1468,15 @@ func processChatAndEmotes(ctx context.Context, archiveDir string, metadata *VODM
 }
 
 // findResumePoint determines the latest timestamp from all possible sources to resume chat download.
-func findResumePoint(archiveDir string, metadata *VODMetadata, state *ProgramState) (time.Time, bool) {
-	finalChatPath := filepath.Join(archiveDir, "chat.json")
+func findResumePoint(archiveDir string, chatDir string, metadata *VODMetadata, state *ProgramState) (time.Time, bool) {
+	finalChatPath := filepath.Join(chatDir, "chat.json")
 	finalChatTime := getLastMessageTimeFromFinalChat(finalChatPath)
 
 	stateTime := state.LastChatTime
 	if stateTime.IsZero() {
 		stateTime = metadata.StartTime
 	}
-	partFileTime := getLastMessageTimeFromPartFiles(archiveDir)
+	partFileTime := getLastMessageTimeFromPartFiles(chatDir)
 
 	latestTime := metadata.StartTime
 	if finalChatTime.After(latestTime) {
@@ -1513,8 +1521,8 @@ func getLastMessageTimeFromFinalChat(chatPath string) time.Time {
 	return latestTime
 }
 
-func getLastMessageTimeFromPartFiles(archiveDir string) time.Time {
-	pattern := filepath.Join(archiveDir, "chat.*.part.json")
+func getLastMessageTimeFromPartFiles(chatDir string) time.Time {
+	pattern := filepath.Join(chatDir, "chat.*.part.json")
 	matches, _ := filepath.Glob(pattern)
 	var latestTime time.Time
 	for _, match := range matches {
@@ -1590,9 +1598,9 @@ func convertKickBadges(badges []Badge) []TDBadge {
 }
 
 // buildEmoteIndex builds a lookup from emote ID to file info using the saved emotes.json DB.
-func buildEmoteIndex(archiveDir string) map[string]emoteIndexEntry {
+func buildEmoteIndex(chatDir string) map[string]emoteIndexEntry {
 	index := make(map[string]emoteIndexEntry)
-	db := loadEmoteDatabase(archiveDir)
+	db := loadEmoteDatabase(chatDir)
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	for id, meta := range db.Emotes {
@@ -1602,7 +1610,7 @@ func buildEmoteIndex(archiveDir string) map[string]emoteIndexEntry {
 		ver := meta.Versions[len(meta.Versions)-1]
 		ext := strings.TrimPrefix(filepath.Ext(ver.FilePath), ".")
 		index[id] = emoteIndexEntry{
-			FilePath: filepath.Join(archiveDir, ver.FilePath),
+			FilePath: filepath.Join(chatDir, ver.FilePath),
 			Ext:      ext,
 		}
 	}
@@ -1642,7 +1650,7 @@ func extractEmotes(content string, seen map[string]bool, tasks chan EmoteTask) {
 }
 
 // emoteWorker is a single worker that pulls emote download tasks from a channel.
-func emoteWorker(ctx context.Context, archiveDir string, tasks chan EmoteTask, results chan *EmoteMetadata, wg *sync.WaitGroup, db *EmoteDatabase) {
+func emoteWorker(ctx context.Context, chatDir string, tasks chan EmoteTask, results chan *EmoteMetadata, wg *sync.WaitGroup, db *EmoteDatabase) {
 	defer wg.Done()
 	for {
 		select {
@@ -1652,12 +1660,12 @@ func emoteWorker(ctx context.Context, archiveDir string, tasks chan EmoteTask, r
 			if !ok {
 				return
 			}
-			processEmote(archiveDir, task, results, db)
+			processEmote(chatDir, task, results, db)
 		}
 	}
 }
 
-func processEmote(archiveDir string, task EmoteTask, results chan *EmoteMetadata, db *EmoteDatabase) {
+func processEmote(chatDir string, task EmoteTask, results chan *EmoteMetadata, db *EmoteDatabase) {
 	emoteURL := fmt.Sprintf("https://files.kick.com/emotes/%s/fullsize", task.ID)
 	resp, err := httpHeadWithRetry(emoteURL)
 	if err != nil {
@@ -1691,7 +1699,7 @@ func processEmote(archiveDir string, task EmoteTask, results chan *EmoteMetadata
 		ext = "gif"
 	}
 
-	emotesDir := filepath.Join(archiveDir, "Emotes")
+	emotesDir := filepath.Join(chatDir, "Emotes")
 	os.MkdirAll(emotesDir, 0755)
 
 	var filename string
@@ -1714,9 +1722,9 @@ func processEmote(archiveDir string, task EmoteTask, results chan *EmoteMetadata
 	atomic.AddInt64(&stats.TotalEmotes, 1)
 }
 
-func loadEmoteDatabase(archiveDir string) *EmoteDatabase {
+func loadEmoteDatabase(chatDir string) *EmoteDatabase {
 	db := &EmoteDatabase{Emotes: make(map[string]*EmoteMetadata)}
-	data, err := os.ReadFile(filepath.Join(archiveDir, "Emotes", "emotes.json"))
+	data, err := os.ReadFile(filepath.Join(chatDir, "Emotes", "emotes.json"))
 	if err == nil {
 		json.Unmarshal(data, &db)
 	}
@@ -1724,14 +1732,14 @@ func loadEmoteDatabase(archiveDir string) *EmoteDatabase {
 }
 
 // emoteMetadataSaver periodically saves the emote database to disk.
-func emoteMetadataSaver(ctx context.Context, archiveDir string, db *EmoteDatabase, results chan *EmoteMetadata) {
+func emoteMetadataSaver(ctx context.Context, chatDir string, db *EmoteDatabase, results chan *EmoteMetadata) {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	save := func() {
 		db.mu.RLock()
 		defer db.mu.RUnlock()
 		data, _ := json.MarshalIndent(db, "", "  ")
-		atomicWriteFile(filepath.Join(archiveDir, "Emotes", "emotes.json"), data)
+		atomicWriteFile(filepath.Join(chatDir, "Emotes", "emotes.json"), data)
 	}
 	for {
 		select {
@@ -1775,9 +1783,9 @@ func trackPinnedMessages(resp *ChatResponse, events *[]PinnedMessageEvent, curre
 
 // mergeChatFiles combines all temporary part files into a single chat.json
 // in TwitchDownloader format with emotes embedded as base64.
-func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []PinnedMessageEvent) error {
+func mergeChatFiles(chatDir string, metadata *VODMetadata, pinnedEvents []PinnedMessageEvent) error {
 	logz("info", EMOJI_PAPER, "Merging chat files...")
-	matches, _ := filepath.Glob(filepath.Join(archiveDir, "chat.*.part.json"))
+	matches, _ := filepath.Glob(filepath.Join(chatDir, "chat.*.part.json"))
 	sort.Strings(matches)
 
 	// Collect and deduplicate messages from all part files.
@@ -1800,7 +1808,7 @@ func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []Pin
 		return allMessages[i].CreatedAt.Before(allMessages[j].CreatedAt)
 	})
 
-	emoteIndex := buildEmoteIndex(archiveDir)
+	emoteIndex := buildEmoteIndex(chatDir)
 	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	streamStart := metadata.StartTime.UTC()
 	allUsedEmoteIDs := make(map[string]bool)
@@ -1900,7 +1908,7 @@ func mergeChatFiles(archiveDir string, metadata *VODMetadata, pinnedEvents []Pin
 		},
 	}
 
-	if err := saveJSONAtomic(filepath.Join(archiveDir, "chat.json"), output); err != nil {
+	if err := saveJSONAtomic(filepath.Join(chatDir, "chat.json"), output); err != nil {
 		return err
 	}
 	for _, match := range matches {
@@ -1967,16 +1975,24 @@ func scanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	return 0, nil, nil
 }
 
-func runChatRender(ctx context.Context, archiveDir string, progressState *ProgressState) error {
+func runChatRender(ctx context.Context, chatDir string, progressState *ProgressState) error {
 	tdcli := findTwitchDownloaderCLI()
 	if tdcli == "" {
 		return fmt.Errorf("TwitchDownloaderCLI not found; place it next to rekick or use --twitchdownloader-cli")
 	}
 
-	chatJSON := filepath.Join(archiveDir, "chat.json")
-	outputPath := filepath.Join(archiveDir, "chat.mp4")
+	chatJSON := filepath.Join(chatDir, "chat.json")
+	outputPath := filepath.Join(chatDir, "chat.mp4")
 
-	args := []string{"chatrender", "-i", chatJSON, "-o", outputPath}
+	args := []string{
+		"chatrender", "-i", chatJSON, "-o", outputPath,
+		"--background-color", "#00000000",
+		"--generate-mask",
+		"--outline",
+		"--chat-width", "274",
+		"--chat-height", "390",
+		"--font-size", "16",
+	}
 	if *renderArgs != "" {
 		args = append(args, strings.Fields(*renderArgs)...)
 	}
