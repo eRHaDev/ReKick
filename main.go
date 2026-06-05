@@ -328,15 +328,28 @@ type TDComment struct {
 }
 
 type TDEmbeddedEmote struct {
-	ID        string `json:"id"`
-	ImageType string `json:"imageType"`
-	Data      string `json:"data"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	ImageType  string `json:"imageType"`
+	ImageScale int    `json:"imageScale"`
+	Data       string `json:"data"`
+}
+
+type TDBadgeVersion struct {
+	Bytes       []byte `json:"bytes"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+type TDEmbeddedBadge struct {
+	Name     string                     `json:"name"`
+	Versions map[string]TDBadgeVersion  `json:"versions"`
 }
 
 type TDEmbeddedData struct {
 	ThirdParty   []TDEmbeddedEmote `json:"thirdParty"`
 	TwitchBits   []interface{}     `json:"twitchBits"`
-	TwitchBadges []interface{}     `json:"twitchBadges"`
+	TwitchBadges []TDEmbeddedBadge `json:"twitchBadges"`
 }
 
 type TDChatOutput struct {
@@ -1551,7 +1564,6 @@ func parseKickContent(content string) (body string, fragments []TDFragment, emot
 
 	for _, idx := range kickEmoteRe.FindAllStringSubmatchIndex(content, -1) {
 		before := content[pos:idx[0]]
-		emoteID := content[idx[2]:idx[3]]
 		emoteName := content[idx[4]:idx[5]]
 
 		if before != "" {
@@ -1560,18 +1572,10 @@ func parseKickContent(content string) (body string, fragments []TDFragment, emot
 			bodyOffset += len([]rune(before))
 		}
 
-		fragments = append(fragments, TDFragment{
-			Text:     emoteName,
-			Emoticon: &TDEmoticon{EmoticonID: emoteID},
-		})
-		emoticons = append(emoticons, TDEmoticonPos{
-			ID:    emoteID,
-			Begin: bodyOffset,
-			End:   bodyOffset + len([]rune(emoteName)),
-		})
+		fragments = append(fragments, TDFragment{Text: emoteName})
 		bodyParts = append(bodyParts, emoteName)
 		bodyOffset += len([]rune(emoteName))
-		usedIDs[emoteID] = true
+		usedIDs[emoteName] = true
 		pos = idx[1]
 	}
 
@@ -1603,18 +1607,112 @@ func buildEmoteIndex(chatDir string) map[string]emoteIndexEntry {
 	db := loadEmoteDatabase(chatDir)
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	for id, meta := range db.Emotes {
-		if len(meta.Versions) == 0 {
+	for _, meta := range db.Emotes {
+		if len(meta.Versions) == 0 || meta.Name == "" {
 			continue
 		}
 		ver := meta.Versions[len(meta.Versions)-1]
 		ext := strings.TrimPrefix(filepath.Ext(ver.FilePath), ".")
-		index[id] = emoteIndexEntry{
+		index[meta.Name] = emoteIndexEntry{
 			FilePath: filepath.Join(chatDir, ver.FilePath),
 			Ext:      ext,
 		}
 	}
 	return index
+}
+
+// findBadgeURLs recursively scans a JSON object for any URL containing a known Kick badge CDN path.
+func findBadgeURLs(obj interface{}, results map[string]string) {
+	switch v := obj.(type) {
+	case map[string]interface{}:
+		for k, val := range v {
+			if s, ok := val.(string); ok {
+				if strings.Contains(s, "channel_subscriber_badges") {
+					results["subscriber_url"] = s
+				}
+			} else {
+				_ = k
+				findBadgeURLs(val, results)
+			}
+		}
+	case []interface{}:
+		for _, item := range v {
+			findBadgeURLs(item, results)
+		}
+	}
+}
+
+// downloadBadgeImage downloads a badge image from url and returns raw bytes.
+func downloadBadgeImage(url string) []byte {
+	resp, err := httpGetWithRetry(url)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil || len(data) == 0 {
+		return nil
+	}
+	return data
+}
+
+// fetchKickBadges downloads all available badge images for the channel and
+// returns them ready for embedding in twitchBadges.
+func fetchKickBadges(channelSlug string, usedBadgeTypes map[string][]string) []TDEmbeddedBadge {
+	// Step 1: get the subscriber badge image URL from the channel API.
+	var subscriberImageData []byte
+	channelURL := fmt.Sprintf("https://kick.com/api/v2/channels/%s", channelSlug)
+	if resp, err := httpGetWithRetry(channelURL); err == nil {
+		defer resp.Body.Close()
+		var channelObj interface{}
+		if json.NewDecoder(resp.Body).Decode(&channelObj) == nil {
+			found := map[string]string{}
+			findBadgeURLs(channelObj, found)
+			if u, ok := found["subscriber_url"]; ok {
+				subscriberImageData = downloadBadgeImage(u)
+			}
+		}
+	}
+
+	// Step 2: for each badge type used in this chat, build the embedded badge.
+	var badges []TDEmbeddedBadge
+	for badgeType, versions := range usedBadgeTypes {
+		var imageData []byte
+
+		switch badgeType {
+		case "subscriber", "sub_gifter":
+			imageData = subscriberImageData
+		default:
+			// Try known Kick global badge CDN patterns.
+			for _, pattern := range []string{
+				fmt.Sprintf("https://files.kick.com/images/badges/%s/1/image", badgeType),
+				fmt.Sprintf("https://files.kick.com/images/badges/%s.png", badgeType),
+			} {
+				if d := downloadBadgeImage(pattern); d != nil {
+					imageData = d
+					break
+				}
+			}
+		}
+
+		if imageData == nil {
+			continue // skip badges we couldn't download
+		}
+
+		b := TDEmbeddedBadge{
+			Name:     badgeType,
+			Versions: make(map[string]TDBadgeVersion),
+		}
+		for _, ver := range versions {
+			b.Versions[ver] = TDBadgeVersion{
+				Bytes:       imageData,
+				Title:       badgeType,
+				Description: badgeType,
+			}
+		}
+		badges = append(badges, b)
+	}
+	return badges
 }
 
 func loadEmoteDataForEmbed(emoteID string, index map[string]emoteIndexEntry) *TDEmbeddedEmote {
@@ -1630,9 +1728,11 @@ func loadEmoteDataForEmbed(emoteID string, index map[string]emoteIndexEntry) *TD
 		return nil
 	}
 	return &TDEmbeddedEmote{
-		ID:        emoteID,
-		ImageType: entry.Ext,
-		Data:      base64.StdEncoding.EncodeToString(data),
+		ID:         emoteID,
+		Name:       emoteID,
+		ImageType:  entry.Ext,
+		ImageScale: imageScaleFromBytes(data),
+		Data:       base64.StdEncoding.EncodeToString(data),
 	}
 }
 
@@ -1665,6 +1765,57 @@ func emoteWorker(ctx context.Context, chatDir string, tasks chan EmoteTask, resu
 	}
 }
 
+func imageExtFromBytes(data []byte) string {
+	if len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
+		return "png"
+	}
+	if len(data) >= 3 && data[0] == 'G' && data[1] == 'I' && data[2] == 'F' {
+		return "gif"
+	}
+	if len(data) >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+		data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' {
+		return "webp"
+	}
+	return "png"
+}
+
+// imageHeightFromBytes extracts the image height from PNG/GIF/WebP bytes.
+func imageHeightFromBytes(data []byte) int {
+	if len(data) >= 4 && data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' {
+		// PNG: height at bytes 20-23, big-endian
+		if len(data) >= 24 {
+			return int(data[20])<<24 | int(data[21])<<16 | int(data[22])<<8 | int(data[23])
+		}
+	}
+	if len(data) >= 3 && data[0] == 'G' && data[1] == 'I' && data[2] == 'F' {
+		// GIF: height at bytes 8-9, little-endian
+		if len(data) >= 10 {
+			return int(data[9])<<8 | int(data[8])
+		}
+	}
+	if len(data) >= 12 && data[0] == 'R' && data[1] == 'I' && data[2] == 'F' && data[3] == 'F' &&
+		data[8] == 'W' && data[9] == 'E' && data[10] == 'B' && data[11] == 'P' {
+		// WebP VP8L: height in bitstream, default 2x scale
+		return 0
+	}
+	return 0
+}
+
+// imageScaleFromBytes returns the imageScale value TwitchDownloaderCLI expects.
+// The formula is: newScale = 2.0 / imageScale * referenceScale * emoteScale
+// We want rendered size ≈ 56px (2x Twitch standard), so target imageScale = height/28.
+func imageScaleFromBytes(data []byte) int {
+	h := imageHeightFromBytes(data)
+	if h <= 0 {
+		return 2 // safe default: treat as 2x
+	}
+	scale := (h + 14) / 28 // round to nearest multiple of 28
+	if scale < 1 {
+		return 1
+	}
+	return scale
+}
+
 func processEmote(chatDir string, task EmoteTask, results chan *EmoteMetadata, db *EmoteDatabase) {
 	emoteURL := fmt.Sprintf("https://files.kick.com/emotes/%s/fullsize", task.ID)
 	resp, err := httpHeadWithRetry(emoteURL)
@@ -1694,10 +1845,7 @@ func processEmote(chatDir string, task EmoteTask, results chan *EmoteMetadata, d
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
 	hash := sha256.Sum256(data)
-	ext := "png"
-	if strings.Contains(resp.Header.Get("Content-Type"), "gif") {
-		ext = "gif"
-	}
+	ext := imageExtFromBytes(data)
 
 	emotesDir := filepath.Join(chatDir, "Emotes")
 	os.MkdirAll(emotesDir, 0755)
@@ -1812,6 +1960,8 @@ func mergeChatFiles(chatDir string, metadata *VODMetadata, pinnedEvents []Pinned
 	nowStr := time.Now().UTC().Format("2006-01-02T15:04:05Z")
 	streamStart := metadata.StartTime.UTC()
 	allUsedEmoteIDs := make(map[string]bool)
+	// badgeVersions tracks which version strings each badge type needs.
+	badgeVersions := make(map[string]map[string]bool)
 	comments := []TDComment{}
 
 	for _, msg := range allMessages {
@@ -1866,7 +2016,16 @@ func mergeChatFiles(chatDir string, metadata *VODMetadata, pinnedEvents []Pinned
 				Body:             body,
 				Emoticons:        emoticons,
 				Fragments:        fragments,
-				UserBadges:       convertKickBadges(msg.Sender.Identity.Badges),
+				UserBadges: func() []TDBadge {
+						result := convertKickBadges(msg.Sender.Identity.Badges)
+						for _, b := range result {
+							if _, ok := badgeVersions[b.ID]; !ok {
+								badgeVersions[b.ID] = make(map[string]bool)
+							}
+							badgeVersions[b.ID][b.Version] = true
+						}
+						return result
+					}(),
 				UserColor:        userColor,
 				UserNoticeParams: map[string]interface{}{},
 			},
@@ -1881,6 +2040,17 @@ func mergeChatFiles(chatDir string, metadata *VODMetadata, pinnedEvents []Pinned
 		}
 	}
 	sort.Slice(thirdParty, func(i, j int) bool { return thirdParty[i].ID < thirdParty[j].ID })
+
+	// Build flat badge type→versions map for fetchKickBadges.
+	usedBadgeTypes := make(map[string][]string)
+	for badgeType, versSet := range badgeVersions {
+		for ver := range versSet {
+			usedBadgeTypes[badgeType] = append(usedBadgeTypes[badgeType], ver)
+		}
+	}
+	logz("info", EMOJI_PAPER, "Downloading badge images for %d badge types...", len(usedBadgeTypes))
+	embeddedBadges := fetchKickBadges(metadata.ChannelInfo.Slug, usedBadgeTypes)
+	logz("ok", EMOJI_CHECK, "Embedded %d/%d badge types", len(embeddedBadges), len(usedBadgeTypes))
 
 	output := TDChatOutput{
 		FileInfo: TDFileInfo{
@@ -1904,7 +2074,7 @@ func mergeChatFiles(chatDir string, metadata *VODMetadata, pinnedEvents []Pinned
 		EmbeddedData: TDEmbeddedData{
 			ThirdParty:   thirdParty,
 			TwitchBits:   []interface{}{},
-			TwitchBadges: []interface{}{},
+			TwitchBadges: embeddedBadges,
 		},
 	}
 
@@ -1989,6 +2159,7 @@ func runChatRender(ctx context.Context, chatDir string, progressState *ProgressS
 		"--background-color", "#00000000",
 		"--generate-mask",
 		"--outline",
+		"--offline",
 		"--chat-width", "274",
 		"--chat-height", "390",
 		"--font-size", "16",
