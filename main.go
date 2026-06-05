@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -32,6 +33,9 @@ import (
 	"golang.org/x/text/transform"
 	"golang.org/x/text/unicode/norm"
 )
+
+//go:embed badges
+var badgesFS embed.FS
 
 // CLI flags
 var (
@@ -335,15 +339,9 @@ type TDEmbeddedEmote struct {
 	Data       string `json:"data"`
 }
 
-type TDBadgeVersion struct {
-	Bytes       []byte `json:"bytes"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-}
-
 type TDEmbeddedBadge struct {
-	Name     string                     `json:"name"`
-	Versions map[string]TDBadgeVersion  `json:"versions"`
+	Name     string            `json:"name"`
+	Versions map[string][]byte `json:"versions"`
 }
 
 type TDEmbeddedData struct {
@@ -586,10 +584,29 @@ func main() {
 		chatCompleted = true
 		progressState.mu.Lock()
 		progressState.ChatDone = true
-		progressState.RenderDone = true // no chat means no render
 		progressState.mu.Unlock()
 		if state.ChatComplete {
 			logz("info", EMOJI_SKIP, "Chat already complete, skipping")
+		}
+		if *noChat && !*noRender {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				renderStart := time.Now()
+				if err := runChatRender(ctx, chatDir, &progressState); err != nil {
+					logz("warn", EMOJI_WARN, "Chat render failed: %v", err)
+				}
+				stats.mu.Lock()
+				stats.RenderDuration = time.Since(renderStart)
+				stats.mu.Unlock()
+				progressState.mu.Lock()
+				progressState.RenderDone = true
+				progressState.mu.Unlock()
+			}()
+		} else {
+			progressState.mu.Lock()
+			progressState.RenderDone = true
+			progressState.mu.Unlock()
 		}
 	}
 
@@ -1554,6 +1571,61 @@ func getLastMessageTimeFromPartFiles(chatDir string) time.Time {
 
 var kickEmoteRe = regexp.MustCompile(`\[emote:(\d+):([a-zA-Z0-9_]+)\]`)
 
+// kickToTwitchBadgeSetID maps Kick badge type names to the Twitch GQL badge setID
+// when they differ. Kick uses underscores; Twitch uses hyphens for some names.
+var kickToTwitchBadgeSetID = map[string]string{
+	"sub_gifter": "sub-gifter",
+	"bot":        "staff",
+	"og":         "premium",
+	"verified":   "partner",
+}
+
+// gqlBadgeEntry is a single badge record from Twitch's GQL global badge response.
+type gqlBadgeEntry struct {
+	ImageURL string `json:"imageURL"`
+	SetID    string `json:"setID"`
+	Version  string `json:"version"`
+}
+
+type gqlGlobalBadgeData struct {
+	Data struct {
+		Badges []gqlBadgeEntry `json:"badges"`
+	} `json:"data"`
+}
+
+// fetchTwitchGlobalBadgeURLs calls Twitch's GQL API (same endpoint used by
+// TwitchDownloader) and returns a setID → version → imageURL map.
+func fetchTwitchGlobalBadgeURLs() map[string]map[string]string {
+	body := `{"query":"query{badges{imageURL(size:DOUBLE),setID,version}}","variables":{}}`
+	req, err := http.NewRequest("POST", "https://gql.twitch.tv/gql", strings.NewReader(body))
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("Client-ID", "kimne78kx3ncx6brgo4mv6wki5h1ko")
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var result gqlGlobalBadgeData
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil
+	}
+
+	out := make(map[string]map[string]string)
+	for _, b := range result.Data.Badges {
+		if out[b.SetID] == nil {
+			out[b.SetID] = make(map[string]string)
+		}
+		out[b.SetID][b.Version] = b.ImageURL
+	}
+	return out
+}
+
 // parseKickContent converts a Kick message content string into TwitchDownloader
 // body text, fragment list, emoticon position list, and the set of emote IDs used.
 func parseKickContent(content string) (body string, fragments []TDFragment, emoticons []TDEmoticonPos, usedIDs map[string]bool) {
@@ -1656,6 +1728,17 @@ func downloadBadgeImage(url string) []byte {
 	return data
 }
 
+func loadEmbeddedBadge(badgeType string) []byte {
+	for _, ext := range []string{"png", "webp", "gif"} {
+		data, err := badgesFS.ReadFile("badges/" + badgeType + "." + ext)
+		if err != nil {
+			continue
+		}
+		return data
+	}
+	return nil
+}
+
 // fetchKickBadges downloads all available badge images for the channel and
 // returns them ready for embedding in twitchBadges.
 func fetchKickBadges(channelSlug string, usedBadgeTypes map[string][]string) []TDEmbeddedBadge {
@@ -1674,41 +1757,69 @@ func fetchKickBadges(channelSlug string, usedBadgeTypes map[string][]string) []T
 		}
 	}
 
-	// Step 2: for each badge type used in this chat, build the embedded badge.
+	// Step 2: fetch Twitch global badge URLs as fallback (same API as TwitchDownloader).
+	logz("info", EMOJI_GEAR, "Fetching Twitch global badge data for fallbacks...")
+	twitchBadgeURLs := fetchTwitchGlobalBadgeURLs()
+	if twitchBadgeURLs == nil {
+		logz("warn", EMOJI_WARN, "Could not fetch Twitch global badge data; some badges may be missing")
+	}
+
+	// Step 3: for each badge type used in this chat, build the embedded badge.
 	var badges []TDEmbeddedBadge
 	for badgeType, versions := range usedBadgeTypes {
 		var imageData []byte
 
 		switch badgeType {
-		case "subscriber", "sub_gifter":
+		case "subscriber":
 			imageData = subscriberImageData
 		default:
-			// Try known Kick global badge CDN patterns.
-			for _, pattern := range []string{
-				fmt.Sprintf("https://files.kick.com/images/badges/%s/1/image", badgeType),
-				fmt.Sprintf("https://files.kick.com/images/badges/%s.png", badgeType),
-			} {
-				if d := downloadBadgeImage(pattern); d != nil {
-					imageData = d
-					break
+			// 1. Embedded badges/ folder (custom SVG/PNG/WebP/GIF).
+			imageData = loadEmbeddedBadge(badgeType)
+			// 2. Kick global badge CDN.
+			if imageData == nil {
+				for _, pattern := range []string{
+					fmt.Sprintf("https://files.kick.com/images/badges/%s/1/image", badgeType),
+					fmt.Sprintf("https://files.kick.com/images/badges/%s.png", badgeType),
+				} {
+					if d := downloadBadgeImage(pattern); d != nil {
+						imageData = d
+						break
+					}
+				}
+			}
+			// 3. Twitch GQL badge data.
+			if imageData == nil && twitchBadgeURLs != nil {
+				twitchSetID, ok := kickToTwitchBadgeSetID[badgeType]
+				if !ok {
+					twitchSetID = badgeType // try same name (e.g. "moderator", "vip")
+				}
+				if versionMap, ok := twitchBadgeURLs[twitchSetID]; ok {
+					// Prefer version "1"; fall back to any available version.
+					imgURL := versionMap["1"]
+					if imgURL == "" {
+						for _, u := range versionMap {
+							imgURL = u
+							break
+						}
+					}
+					if imgURL != "" {
+						imageData = downloadBadgeImage(imgURL)
+					}
 				}
 			}
 		}
 
 		if imageData == nil {
-			continue // skip badges we couldn't download
+			logz("warn", EMOJI_WARN, "No badge image found for badge type: %s", badgeType)
+			continue
 		}
 
 		b := TDEmbeddedBadge{
 			Name:     badgeType,
-			Versions: make(map[string]TDBadgeVersion),
+			Versions: make(map[string][]byte),
 		}
 		for _, ver := range versions {
-			b.Versions[ver] = TDBadgeVersion{
-				Bytes:       imageData,
-				Title:       badgeType,
-				Description: badgeType,
-			}
+			b.Versions[ver] = imageData
 		}
 		badges = append(badges, b)
 	}
@@ -2183,6 +2294,9 @@ func runChatRender(ctx context.Context, chatDir string, progressState *ProgressS
 
 	// Drain stdout and stderr concurrently — sequential MultiReader can deadlock
 	// when the process writes to the other pipe while we're blocked on this one.
+	var outputMu sync.Mutex
+	var outputLines []string
+
 	handlePipe := func(r io.Reader, wg *sync.WaitGroup) {
 		defer wg.Done()
 		scanner := bufio.NewScanner(r)
@@ -2192,6 +2306,9 @@ func runChatRender(ctx context.Context, chatDir string, progressState *ProgressS
 			if line == "" {
 				continue
 			}
+			outputMu.Lock()
+			outputLines = append(outputLines, line)
+			outputMu.Unlock()
 			logz("debug", EMOJI_BUG, "[render] %s", line)
 			low := strings.ToLower(line)
 			if strings.Contains(line, "%") || strings.Contains(low, "status") ||
@@ -2214,7 +2331,13 @@ func runChatRender(ctx context.Context, chatDir string, progressState *ProgressS
 		progressState.mu.Lock()
 		progressState.RenderStatus = "Failed"
 		progressState.mu.Unlock()
-		return fmt.Errorf("TwitchDownloaderCLI exited with error: %v", err)
+		outputMu.Lock()
+		captured := strings.Join(outputLines, "\n")
+		outputMu.Unlock()
+		if captured != "" {
+			return fmt.Errorf("TwitchDownloaderCLI exited with error: %v\n%s", err, captured)
+		}
+		return fmt.Errorf("TwitchDownloaderCLI exited with error: %v (no output captured — check .NET 6 Desktop Runtime is installed)", err)
 	}
 
 	progressState.mu.Lock()
